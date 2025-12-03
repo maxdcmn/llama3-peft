@@ -1,184 +1,312 @@
 import os
-import secrets
-from datetime import datetime
+import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, List
 
-from .common import HOURS, MINUTES, VOLUME_CONFIG, app, axolotl_image
+import modal
+import torch
+from datasets import Dataset, load_dataset
+from huggingface_hub import snapshot_download
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
 
-GPU_CONFIG = os.environ.get("GPU_CONFIG", "a100:2")
-if len(GPU_CONFIG.split(":")) <= 1:
-    N_GPUS = int(os.environ.get("N_GPUS", 2))
-    GPU_CONFIG = f"{GPU_CONFIG}:{N_GPUS}"
-SINGLE_GPU_CONFIG = os.environ.get("GPU_CONFIG", "a10g:1")
+APP_DIR = Path("/app")
+if APP_DIR.exists():
+    sys.path.insert(0, str(APP_DIR))
 
-
-@app.function(
-    image=axolotl_image,
-    gpu=GPU_CONFIG,
-    volumes=VOLUME_CONFIG,
-    timeout=24 * HOURS,
-)
-def train(run_folder: str, output_dir: str):
-    import torch
-
-    print(f"Starting training run in {run_folder}.")
-    print(f"Using {torch.cuda.device_count()} {torch.cuda.get_device_name()} GPU(s).")
-
-    ALLOW_WANDB = os.environ.get("ALLOW_WANDB", "false").lower() == "true"
-    cmd = f"accelerate launch --num_processes {torch.cuda.device_count()} --num_machines 1 --mixed_precision no --dynamo_backend no -m axolotl.cli.train ./config.yml {'--wandb_mode disabled' if not ALLOW_WANDB else ''}"
-    run_cmd(cmd, run_folder)
-
-    # Kick off CPU job to merge the LoRA weights into base model.
-    merge_handle = merge.spawn(run_folder, output_dir)
-    with open(f"{run_folder}/logs.txt", "a") as f:
-        f.write(f"<br>merge: https://modal.com/logs/call/{merge_handle.object_id}\n")
-        print(f"Beginning merge {merge_handle.object_id}.")
-    return merge_handle
+try:
+    from .common import HOURS, MINUTES, VOLUME_CONFIG, app, image
+except ImportError:
+    from src.common import HOURS, MINUTES, VOLUME_CONFIG, app, image
 
 
-@app.function(
-    image=axolotl_image,
-    gpu=SINGLE_GPU_CONFIG,
-    volumes=VOLUME_CONFIG,
-    timeout=24 * HOURS,
-)
-def preproc_data(run_folder: str):
-    print("Preprocessing data.")
-    run_cmd(
-        "python -W ignore:::torch.nn.modules.module -m axolotl.cli.preprocess ./config.yml",
-        run_folder,
+@dataclass
+class TrainingConfig:
+    """
+    Training configuration for the model.
+    """
+
+    model_id: str = "meta-llama/Llama-3.2-3B-Instruct"
+    dataset_id: str = "mlabonne/FineTome-100k"
+    dataset_split: str = "train"
+    sequence_length: int = 1024
+    batch_size_per_device: int = 1
+    gradient_accumulation: int = 8
+    warmup_steps: int = 50
+    lr: float = 2e-4
+    weight_decay: float = 0.01
+    epochs: int = 1
+    max_training_steps: int = 200
+    log_interval: int = 5
+    checkpoint_interval: int = 100
+    results_dir: str = "/outputs"
+    model_cache_dir: str | None = None
+    random_seed: int = 9024309
+    enable_gradient_checkpointing: bool = False
+    gradient_checkpointing_opts: dict | None = field(
+        default_factory=lambda: {"use_reentrant": False}
+    )
+    ddp_unused_params: bool | None = False
+    precision: Any = field(
+        default_factory=lambda: (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+    )
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout_rate: float = 0.05
+    lora_targets: List[str] = field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
     )
 
 
-@app.function(
-    image=axolotl_image,
-    gpu=SINGLE_GPU_CONFIG,
-    volumes=VOLUME_CONFIG,
-    timeout=24 * HOURS,
-)
-def merge(run_folder: str, output_dir: str):
-    import shutil
-
-    import torch
-
-    output_path = Path(run_folder) / output_dir
-    shutil.rmtree(output_path / "merged", ignore_errors=True)
-
-    with open(f"{run_folder}/config.yml"):
-        print(f"Merge from {output_path}")
-
-    MERGE_CMD = f"accelerate launch --num_processes {torch.cuda.device_count()} --num_machines 1 --mixed_precision no --dynamo_backend no -m axolotl.cli.merge_lora ./config.yml --lora_model_dir='{output_dir}'"
-    run_cmd(MERGE_CMD, run_folder)
-
-    VOLUME_CONFIG["/runs"].commit()
-
-
-@app.function(image=axolotl_image, timeout=30 * MINUTES, volumes=VOLUME_CONFIG)
-def launch(config_raw: dict, data_raw: str, run_to_resume: str, preproc_only: bool):
-    import yaml
-    from huggingface_hub import snapshot_download
-
-    # Ensure the base model is downloaded
-    # TODO(gongy): test if this works with a path to previous fine-tune
-    config = yaml.safe_load(config_raw)
-    model_name = config["base_model"]
-
-    try:
-        snapshot_download(model_name, local_files_only=True)
-        print(f"Volume contains {model_name}.")
-    except FileNotFoundError:
-        print(f"Downloading {model_name} ...")
-        snapshot_download(model_name)
-
-        print("Committing /pretrained directory (no progress bar) ...")
-        VOLUME_CONFIG["/pretrained"].commit()
-
-    # Write config and data into a training subfolder.
-    time_string = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    run_name = (
-        f"axo-{time_string}-{secrets.token_hex(2)}"
-        if not run_to_resume
-        else run_to_resume
-    )
-    run_folder = f"/runs/{run_name}"
-    os.makedirs(run_folder, exist_ok=True)
-
-    print(f"Preparing training run in {run_folder}.")
-    with (
-        open(f"{run_folder}/config.yml", "w") as config_file,
-        open(f"{run_folder}/{config['datasets'][0]['path']}", "w") as data_file,
-    ):
-        config_file.write(config_raw)
-        data_file.write(data_raw)
-    VOLUME_CONFIG["/runs"].commit()
-
-    if preproc_only:
-        print("Spawning container for data preprocessing.")
-        launch_handle = preproc_data.spawn(run_folder)
+def prepare_dataset(cfg: TrainingConfig) -> Dataset:
+    """
+    Load and prepare the training dataset.
+    """
+    if cfg.dataset_id.startswith("local:"):
+        local_path = cfg.dataset_id.replace("local:", "")
+        if not os.path.isabs(local_path):
+            base_dir = Path(__file__).parent.parent
+            local_path = base_dir / local_path
+        ds = load_dataset("json", data_files=str(local_path), split="train")
     else:
-        print("Spawning container for data preprocessing.")
-        preproc_handle = preproc_data.spawn(run_folder)
-        with open(f"{run_folder}/logs.txt", "w") as f:
-            lbl = "preproc"
-            f.write(f"{lbl}: https://modal.com/logs/call/{preproc_handle.object_id}")
-        # wait for preprocessing to finish.
-        preproc_handle.get()
+        ds = load_dataset(cfg.dataset_id, split=cfg.dataset_split)
 
-        # Start training run.
-        print("Spawning container for training.")
-        launch_handle = train.spawn(run_folder, config["output_dir"])
+    def format_conversation(example):
+        conv = example.get("conversations", [])
+        parts = []
+        for turn in conv:
+            content = turn.get("value")
+            if not content:
+                continue
+            role = turn.get("from", "").lower()
+            prefix = "User" if role in ("human", "user") else "Assistant"
+            parts.append(f"{prefix}: {content}")
+        example["text"] = "\n\n".join(parts)
+        return example
 
-    with open(f"{run_folder}/logs.txt", "w") as f:
-        lbl = "train" if not preproc_only else "preproc"
-        f.write(f"{lbl}: https://modal.com/logs/call/{launch_handle.object_id}")
-    VOLUME_CONFIG["/runs"].commit()
+    ds = ds.map(format_conversation, remove_columns=["conversations"])
+    ds = ds.filter(
+        lambda x: isinstance(x.get("text"), str) and len(x["text"].strip()) > 0
+    )
+    return ds
 
-    return run_name, launch_handle
+
+def load_tokenizer(cfg: TrainingConfig):
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_cache_dir,
+        use_fast=False,
+        trust_remote_code=True,
+    )
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = cfg.sequence_length
+    return tokenizer
+
+
+def load_base_model(cfg: TrainingConfig):
+    return AutoModelForCausalLM.from_pretrained(
+        cfg.model_cache_dir,
+        dtype=cfg.precision,
+        device_map=None,
+        trust_remote_code=True,
+    )
+
+
+def create_trainer(
+    cfg: TrainingConfig, model, tokenizer, dataset: Dataset
+) -> SFTTrainer:
+    peft_config = LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout_rate,
+        target_modules=cfg.lora_targets,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+    training_args = SFTConfig(
+        dataset_text_field="text",
+        max_length=cfg.sequence_length,
+        per_device_train_batch_size=cfg.batch_size_per_device,
+        gradient_accumulation_steps=cfg.gradient_accumulation,
+        warmup_steps=cfg.warmup_steps,
+        learning_rate=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        num_train_epochs=cfg.epochs,
+        max_steps=cfg.max_training_steps,
+        logging_steps=cfg.log_interval,
+        save_steps=cfg.checkpoint_interval,
+        save_total_limit=3,
+        output_dir=cfg.results_dir,
+        bf16=cfg.precision == torch.bfloat16,
+        fp16=cfg.precision == torch.float16,
+        seed=cfg.random_seed,
+        packing=False,
+        report_to="wandb",
+        dataset_num_proc=2,
+        gradient_checkpointing=cfg.enable_gradient_checkpointing,
+        gradient_checkpointing_kwargs=cfg.gradient_checkpointing_opts,
+        ddp_find_unused_parameters=cfg.ddp_unused_params,
+    )
+
+    return SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+    )
+
+
+def run_training(cfg: TrainingConfig) -> None:
+    Path(cfg.results_dir).mkdir(parents=True, exist_ok=True)
+
+    cache_folder_name = cfg.model_cache_dir or cfg.model_id.replace("/", "__")
+    cache_path = Path(cfg.results_dir) / cache_folder_name
+    token = os.environ.get("HF_TOKEN")
+
+    if not cache_path.exists() or not any(cache_path.iterdir()):
+        snapshot_download(
+            repo_id=cfg.model_id,
+            local_dir=str(cache_path),
+            token=token,
+        )
+
+    cfg.model_cache_dir = str(cache_path)
+    cfg.results_dir = str(cache_path)
+
+    dataset = prepare_dataset(cfg)
+    tokenizer = load_tokenizer(cfg)
+    model = load_base_model(cfg)
+    trainer = create_trainer(cfg, model, tokenizer, dataset)
+
+    trainer.train()
+
+    trainer.save_model(cfg.results_dir)
+    tokenizer.save_pretrained(cfg.results_dir)
+
+
+@app.function(
+    image=image,
+    gpu="A100:2",
+    timeout=3 * HOURS,
+    volumes=VOLUME_CONFIG,
+    env={
+        "NCCL_DEBUG": "WARN",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    },
+    secrets=[
+        modal.Secret.from_name("my-huggingface-secret"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def train_distributed():
+    num_gpus = max(1, torch.cuda.device_count())
+
+    subprocess.run(
+        [
+            "accelerate",
+            "launch",
+            "--num_processes",
+            str(num_gpus),
+            "--num_machines",
+            "1",
+            "--mixed_precision",
+            (
+                "bf16"
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                else "fp16"
+            ),
+            "/app/src/train.py",
+        ],
+        check=True,
+        cwd="/app",
+    )
+
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("my-huggingface-secret"),
+        modal.Secret.from_name("wandb"),
+    ],
+    volumes=VOLUME_CONFIG,
+)
+def upload_model(checkpoint_path: str, repo_name: str | None = None):
+    from huggingface_hub import HfApi
+
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        raise ValueError("HF_TOKEN environment variable must be set")
+
+    api = HfApi(token=token)
+    username = api.whoami(token=token)["name"]
+
+    checkpoint_dir = Path(checkpoint_path)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_dir}")
+
+    if not repo_name:
+        repo_name = f"{username}/{checkpoint_dir.name}-fine-tuned"
+
+    api.create_repo(repo_id=repo_name, repo_type="model", exist_ok=True)
+    api.upload_folder(
+        repo_id=repo_name,
+        repo_type="model",
+        folder_path=str(checkpoint_dir),
+        path_in_repo=".",
+        commit_message="Upload fine-tuned LoRA adapter weights",
+    )
+    return repo_name
 
 
 @app.local_entrypoint()
-def main(
-    config: str,
-    data: str,
-    merge_lora: bool = True,
-    preproc_only: bool = False,
-    run_to_resume: str = "",
-):
-    # Read config and data source files and pass their contents to the remote function.
-    with open(config, "r") as cfg, open(data, "r") as dat:
-        run_name, launch_handle = launch.remote(
-            cfg.read(), dat.read(), run_to_resume, preproc_only
-        )
-
-    # Write a local reference to the location on the remote volume with the run
-    with open(".last_run_name", "w") as f:
-        f.write(run_name)
-
-    # Wait for the training run to finish.
-    merge_handle = launch_handle.get()
-    if merge_lora and not preproc_only:
-        merge_handle.get()
-
-    print(f"Run complete. Tag: {run_name}")
-    print(f"To inspect outputs, run `modal volume ls example-runs-vol {run_name}`")
-    if not preproc_only:
-        print(
-            f"To run sample inference, run `modal run --quiet -m src.inference --run-name {run_name}`"
-        )
+def run():
+    """
+    Local entrypoint to start training.
+    """
+    train_distributed.remote()
 
 
-def run_cmd(cmd: str, run_folder: str):
-    """Run a command inside a folder, with Modal Volume reloading before and commit on success."""
-    import subprocess
+@app.local_entrypoint()
+def push(checkpoint_path: str, repo_name: str = ""):
+    """
+    Local entrypoint to push model to HF.
+    """
+    repo_id = upload_model.remote(checkpoint_path, repo_name if repo_name else None)
+    print(f"Uploaded to https://huggingface.co/{repo_id}")
 
-    # Ensure volumes contain latest files.
-    VOLUME_CONFIG["/pretrained"].reload()
-    VOLUME_CONFIG["/runs"].reload()
 
-    # Propagate errors from subprocess.
-    if exit_code := subprocess.call(cmd.split(), cwd=run_folder):
-        exit(exit_code)
-
-    # Commit writes to volume.
-    VOLUME_CONFIG["/runs"].commit()
-
+if __name__ == "__main__":
+    config = TrainingConfig(
+        model_id="meta-llama/Llama-3.2-3B-Instruct",
+        dataset_id="mlabonne/FineTome-100k",
+        dataset_split="train",
+        sequence_length=1024,
+        batch_size_per_device=1,
+        gradient_accumulation=8,
+        epochs=1,
+        warmup_steps=50,
+        max_training_steps=200,
+        lr=2e-4,
+        log_interval=5,
+        checkpoint_interval=100,
+        results_dir="/outputs",
+    )
+    run_training(config)

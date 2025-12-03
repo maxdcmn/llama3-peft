@@ -1,41 +1,33 @@
-import os
-from pathlib import PurePosixPath
-from typing import Union
+import sys
+from pathlib import Path
 
 import modal
 
-APP_NAME = "example-axolotl"
+APP_DIR = Path("/app")
+if APP_DIR.exists():
+    sys.path.insert(0, str(APP_DIR))
 
-MINUTES = 60  # seconds
-HOURS = 60 * MINUTES
+app = modal.App(name="llama3-peft-training")
 
-# Axolotl image hash corresponding to main-20240705-py3.11-cu121-2.3.0
-AXOLOTL_REGISTRY_SHA = ("9578c47333bdcc9ad7318e54506b9adaf283161092ae780353d506f7a656590a")
+vol = modal.Volume.from_name("model-checkpoints", create_if_missing=True)
 
-
-ALLOW_WANDB = os.environ.get("ALLOW_WANDB", "false").lower() == "true"
-
-axolotl_image = (
-    modal.Image.from_registry(
-        f"winglian/axolotl:main-py3.11-cu121-2.3.0"
-        f"winglian/axolotl@sha256:{AXOLOTL_REGISTRY_SHA}"
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install_from_pyproject("pyproject.toml")
+    .add_local_dir(
+        ".",
+        "/app",
+        ignore=[
+            ".venv",
+            ".git",
+            "__pycache__",
+            "model-checkpoints",
+            ".modal_cache",
+            "**/.venv/**",
+            "**/.git/**",
+            "**/__pycache__/**",
+        ],
     )
-    .pip_install(
-        "huggingface_hub==0.23.2",
-        "hf-transfer==0.1.5",
-        "wandb==0.16.3",
-        "fastapi==0.110.0",
-        "pydantic==2.6.3",
-    )
-    .env(
-        dict(
-            HUGGINGFACE_HUB_CACHE="/pretrained",
-            HF_HUB_ENABLE_HF_TRANSFER="1",
-            TQDM_DISABLE="true",
-            AXOLOTL_NCCL_TIMEOUT="60",
-        )
-    )
-    .entrypoint([])
 )
 
 vllm_image = (
@@ -44,29 +36,13 @@ vllm_image = (
     .entrypoint([])
 )
 
-app = modal.App(
-    APP_NAME,
-    secrets=[
-        modal.Secret.from_name("my-huggingface-secret"),
-        modal.Secret.from_dict({"ALLOW_WANDB": os.environ.get("ALLOW_WANDB", "false")}),
-        *([modal.Secret.from_name("wandb")] if ALLOW_WANDB else []),
-    ],
-)
+MINUTES = 60
+HOURS = 60 * MINUTES
 
-# Volumes for pre-trained models and training runs.
-pretrained_volume = modal.Volume.from_name(
-    "example-pretrained-vol", create_if_missing=True
-)
-runs_volume = modal.Volume.from_name("example-runs-vol", create_if_missing=True)
-VOLUME_CONFIG: dict[Union[str, PurePosixPath], modal.Volume] = {
-    "/pretrained": pretrained_volume,
-    "/runs": runs_volume,
-}
+VOLUME_CONFIG = {"/outputs": vol}
 
 
 class Colors:
-    """ANSI color codes"""
-
     GREEN = "\033[0;32m"
     BLUE = "\033[0;34m"
     GRAY = "\033[0;90m"
