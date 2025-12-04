@@ -1,14 +1,18 @@
+import json
 import os
+import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 
 import modal
 import torch
+import yaml
 from datasets import Dataset, load_dataset
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
@@ -73,6 +77,34 @@ class TrainingConfig:
     )
 
 
+def load_config(config_path: str) -> TrainingConfig:
+    """Load training configuration from a YAML file."""
+    config_path = Path(config_path)
+    if not config_path.is_absolute():
+        modal_path = APP_DIR / config_path
+        if modal_path.exists():
+            config_path = modal_path
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with config_path.open() as f:
+        d = yaml.safe_load(f) or {}
+    
+    defaults = TrainingConfig()
+    kwargs = {}
+    for f in fields(TrainingConfig):
+        value = d.get(f.name, getattr(defaults, f.name))
+        if isinstance(value, str) and f.type in (float, int):
+            try:
+                value = float(value) if f.type == float else int(value)
+            except ValueError:
+                pass
+        kwargs[f.name] = value
+    
+    return TrainingConfig(**kwargs)
+
+
 def prepare_dataset(cfg: TrainingConfig) -> Dataset:
     """
     Load and prepare the training dataset.
@@ -129,7 +161,7 @@ def load_base_model(cfg: TrainingConfig):
 
 
 def create_trainer(
-    cfg: TrainingConfig, model, tokenizer, dataset: Dataset
+    cfg: TrainingConfig, model, tokenizer, dataset: Dataset, run_name: str
 ) -> SFTTrainer:
     peft_config = LoraConfig(
         r=cfg.lora_rank,
@@ -159,6 +191,7 @@ def create_trainer(
         seed=cfg.random_seed,
         packing=False,
         report_to="wandb",
+        run_name=run_name,
         dataset_num_proc=2,
         gradient_checkpointing=cfg.enable_gradient_checkpointing,
         gradient_checkpointing_kwargs=cfg.gradient_checkpointing_opts,
@@ -175,26 +208,28 @@ def create_trainer(
 
 
 def run_training(cfg: TrainingConfig) -> None:
-    Path(cfg.results_dir).mkdir(parents=True, exist_ok=True)
+    base_dir = Path(cfg.results_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_folder_name = cfg.model_cache_dir or cfg.model_id.replace("/", "__")
-    cache_path = Path(cfg.results_dir) / cache_folder_name
+    exp_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    exp_dir = base_dir / exp_id
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    
+    with (exp_dir / "config.yaml").open("w") as f:
+        yaml.dump(asdict(cfg), f, default_flow_style=False, sort_keys=False)
+    
+    cache_path = base_dir / (cfg.model_cache_dir or cfg.model_id.replace("/", "__"))
     token = os.environ.get("HF_TOKEN")
-
     if not cache_path.exists() or not any(cache_path.iterdir()):
-        snapshot_download(
-            repo_id=cfg.model_id,
-            local_dir=str(cache_path),
-            token=token,
-        )
+        snapshot_download(repo_id=cfg.model_id, local_dir=str(cache_path), token=token)
 
     cfg.model_cache_dir = str(cache_path)
-    cfg.results_dir = str(cache_path)
+    cfg.results_dir = str(exp_dir)
 
     dataset = prepare_dataset(cfg)
     tokenizer = load_tokenizer(cfg)
     model = load_base_model(cfg)
-    trainer = create_trainer(cfg, model, tokenizer, dataset)
+    trainer = create_trainer(cfg, model, tokenizer, dataset, exp_id)
 
     trainer.train()
 
@@ -204,7 +239,7 @@ def run_training(cfg: TrainingConfig) -> None:
 
 @app.function(
     image=image,
-    gpu="A100:2",
+    gpu="A100:4",
     timeout=3 * HOURS,
     volumes=VOLUME_CONFIG,
     env={
@@ -216,27 +251,34 @@ def run_training(cfg: TrainingConfig) -> None:
         modal.Secret.from_name("wandb"),
     ],
 )
-def train_distributed():
+def train_distributed(config_path: str | None = None):
+    """Launch distributed training via accelerate."""
     num_gpus = max(1, torch.cuda.device_count())
+    precision_str = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "fp16"
 
+    cmd = [
+        "accelerate",
+        "launch",
+        "--num_processes",
+        str(num_gpus),
+        "--num_machines",
+        "1",
+        "--mixed_precision",
+        precision_str,
+        "--dynamo_backend",
+        "no",
+        "/app/src/train.py",
+    ]
+    
+    env = os.environ.copy()
+    if config_path:
+        env["TRAIN_CONFIG_PATH"] = config_path
+    
     subprocess.run(
-        [
-            "accelerate",
-            "launch",
-            "--num_processes",
-            str(num_gpus),
-            "--num_machines",
-            "1",
-            "--mixed_precision",
-            (
-                "bf16"
-                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                else "fp16"
-            ),
-            "/app/src/train.py",
-        ],
+        cmd,
         check=True,
         cwd="/app",
+        env=env,
     )
 
 
@@ -248,9 +290,7 @@ def train_distributed():
     ],
     volumes=VOLUME_CONFIG,
 )
-def upload_model(checkpoint_path: str, repo_name: str | None = None):
-    from huggingface_hub import HfApi
-
+def push_to_hub(checkpoint_path: str, repo_name: str):
     token = os.environ.get("HF_TOKEN")
     if not token:
         raise ValueError("HF_TOKEN environment variable must be set")
@@ -259,54 +299,67 @@ def upload_model(checkpoint_path: str, repo_name: str | None = None):
     username = api.whoami(token=token)["name"]
 
     checkpoint_dir = Path(checkpoint_path)
+    
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_dir}")
 
-    if not repo_name:
-        repo_name = f"{username}/{checkpoint_dir.name}-fine-tuned"
+    config_path = checkpoint_dir / "config.yaml"
+    if config_path.exists():
+        model_id = yaml.safe_load(config_path.open()).get("model_id", "meta-llama/Llama-3.2-3B-Instruct")
+    else:
+        adapter_path = checkpoint_dir / "adapter_config.json"
+        base_model = json.load(adapter_path.open()).get("base_model_name_or_path", "")
+        model_id = base_model.replace("/outputs/", "").replace("__", "/") if base_model.startswith("/outputs/") else base_model
 
+    adapter_path = checkpoint_dir / "adapter_config.json"
+    adapter_config = json.load(adapter_path.open())
+    if adapter_config.get("base_model_name_or_path", "").startswith("/outputs/"):
+        adapter_config["base_model_name_or_path"] = model_id
+        json.dump(adapter_config, adapter_path.open("w"), indent=2)
+
+    repo_name = f"{username}/{repo_name}"
     api.create_repo(repo_id=repo_name, repo_type="model", exist_ok=True)
-    api.upload_folder(
-        repo_id=repo_name,
-        repo_type="model",
-        folder_path=str(checkpoint_dir),
-        path_in_repo=".",
-        commit_message="Upload fine-tuned LoRA adapter weights",
-    )
+    api.upload_folder(repo_id=repo_name, repo_type="model", folder_path=str(checkpoint_dir), path_in_repo=".", commit_message="Upload fine-tuned LoRA adapter weights")
     return repo_name
 
 
 @app.local_entrypoint()
-def run():
+def run(config_path: str | None = None):
     """
     Local entrypoint to start training.
+    
+    Args:
+        config_path: Optional path to YAML config file (e.g., "config/llama-train.yml")
     """
-    train_distributed.remote()
+    train_distributed.remote(config_path)
 
 
 @app.local_entrypoint()
-def push(checkpoint_path: str, repo_name: str = ""):
+def push(checkpoint_path: str, repo_name: str):
     """
     Local entrypoint to push model to HF.
+    Calls the remote Modal function which has access to volumes.
+    
+    Args:
+        checkpoint_path: Path to checkpoint directory (e.g., "/outputs/20251204-112716/checkpoint-1000")
+        repo_name: Repo name (e.g., "llama-finetome" creates "username/llama-finetome")
     """
-    repo_id = upload_model.remote(checkpoint_path, repo_name if repo_name else None)
+    repo_id = push_to_hub.remote(checkpoint_path, repo_name)
     print(f"Uploaded to https://huggingface.co/{repo_id}")
 
 
 if __name__ == "__main__":
-    config = TrainingConfig(
-        model_id="meta-llama/Llama-3.2-3B-Instruct",
-        dataset_id="mlabonne/FineTome-100k",
-        dataset_split="train",
-        sequence_length=1024,
-        batch_size_per_device=1,
-        gradient_accumulation=8,
-        epochs=1,
-        warmup_steps=50,
-        max_training_steps=200,
-        lr=2e-4,
-        log_interval=5,
-        checkpoint_interval=100,
-        results_dir="/outputs",
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train a model with LoRA fine-tuning")
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to YAML configuration file",
     )
+    args = parser.parse_args()
+    
+    config_path = args.config or os.environ.get("TRAIN_CONFIG_PATH")
+    
+    config = load_config(config_path) if config_path else TrainingConfig()
     run_training(config)
