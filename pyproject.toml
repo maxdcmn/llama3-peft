@@ -5,17 +5,21 @@ description = "Finetuning LLama 3"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.1.0",
     "datasets>=4.4.1",
+    "ddgs>=1.0.0",
     "dotenv>=0.9.9",
     "fastapi>=0.123.0",
+    "google-generativeai>=0.8.0",
     "gradio>=6.0.2",
     "huggingface-hub>=0.36.0",
     "ipykernel>=7.1.0",
     "modal>=1.2.4",
+    "openai>=2.8.1",
     "peft>=0.18.0",
+    "pyyaml>=6.0",
     "torch>=2.9.1",
     "transformers>=4.57.3",
     "trl>=0.25.1",
-    "unsloth>=2024.8",
     "wandb>=0.23.0",
 ]

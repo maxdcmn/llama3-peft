@@ -26,10 +26,16 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+.DS_Store
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .cache/
-
+.modal_cache/
 .ipynb_checkpoints/
 *.log
+
+.env
+!.env.example
+
+.last_run_name

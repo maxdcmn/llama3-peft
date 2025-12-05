@@ -1,10 +1,9 @@
+import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 
@@ -12,7 +11,7 @@ import modal
 import torch
 import yaml
 from datasets import Dataset, load_dataset
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
@@ -42,12 +41,14 @@ class TrainingConfig:
     warmup_steps: int = 50
     lr: float = 2e-4
     weight_decay: float = 0.01
+    lr_scheduler_type: str = "linear"
+    optim: str = "adamw_torch"
     epochs: int = 1
     max_training_steps: int = 200
     log_interval: int = 5
     checkpoint_interval: int = 100
+    save_total_limit: int = 3
     results_dir: str = "/outputs"
-    model_cache_dir: str | None = None
     random_seed: int = 9024309
     enable_gradient_checkpointing: bool = False
     gradient_checkpointing_opts: dict | None = field(
@@ -75,89 +76,92 @@ class TrainingConfig:
             "down_proj",
         ]
     )
+    resume_from_checkpoint: str = None
+    config_name: str = None
 
 
 def load_config(config_path: str) -> TrainingConfig:
     """Load training configuration from a YAML file."""
-    config_path = Path(config_path)
-    if not config_path.is_absolute():
-        modal_path = APP_DIR / config_path
-        if modal_path.exists():
-            config_path = modal_path
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    with config_path.open() as f:
-        d = yaml.safe_load(f) or {}
-    
+    path = Path(config_path)
+    if not path.is_absolute() and (modal_path := APP_DIR / path).exists():
+        path = modal_path
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    with path.open() as f:
+        data = yaml.safe_load(f) or {}
+
     defaults = TrainingConfig()
     kwargs = {}
     for f in fields(TrainingConfig):
-        value = d.get(f.name, getattr(defaults, f.name))
+        value = data.get(f.name, getattr(defaults, f.name))
         if isinstance(value, str) and f.type in (float, int):
             try:
                 value = float(value) if f.type == float else int(value)
             except ValueError:
                 pass
         kwargs[f.name] = value
-    
+
+    if kwargs.get("config_name") is None:
+        raise ValueError("config_name must be specified in config file")
+
     return TrainingConfig(**kwargs)
 
 
-def prepare_dataset(cfg: TrainingConfig) -> Dataset:
-    """
-    Load and prepare the training dataset.
-    """
+def prepare_dataset(cfg: TrainingConfig, tokenizer) -> Dataset:
     if cfg.dataset_id.startswith("local:"):
-        local_path = cfg.dataset_id.replace("local:", "")
-        if not os.path.isabs(local_path):
-            base_dir = Path(__file__).parent.parent
-            local_path = base_dir / local_path
-        ds = load_dataset("json", data_files=str(local_path), split="train")
+        path = Path(cfg.dataset_id.replace("local:", ""))
+        if not path.is_absolute():
+            path = Path(__file__).parent.parent / path
+        ds = load_dataset("json", data_files=str(path), split="train")
     else:
         ds = load_dataset(cfg.dataset_id, split=cfg.dataset_split)
 
-    def format_conversation(example):
+    ROLE_MAP = {"human": "user", "gpt": "assistant"}
+
+    def normalize_to_messages(example):
         conv = example.get("conversations", [])
-        parts = []
+        if not conv:
+            return {"text": ""}
+
+        messages = []
         for turn in conv:
-            content = turn.get("value")
-            if not content:
-                continue
-            role = turn.get("from", "").lower()
-            prefix = "User" if role in ("human", "user") else "Assistant"
-            parts.append(f"{prefix}: {content}")
-        example["text"] = "\n\n".join(parts)
-        return example
+            if "from" in turn:
+                msg = {
+                    "role": ROLE_MAP.get(turn.get("from", "user"), "user"),
+                    "content": turn.get("value", ""),
+                }
+            elif turn.get("role") == "tool":
+                msg = {
+                    "role": "tool",
+                    "content": turn.get("content", ""),
+                    "tool_call_id": turn.get("tool_call_id"),
+                    "name": turn.get("name"),
+                }
+            else:
+                msg = {
+                    "role": turn.get("role", "assistant"),
+                    "content": turn.get("content", ""),
+                }
+                tool_calls = turn.get("tool_calls")
+                if tool_calls and len(tool_calls) > 0:
+                    msg["tool_calls"] = tool_calls
+            messages.append(msg)
 
-    ds = ds.map(format_conversation, remove_columns=["conversations"])
-    ds = ds.filter(
-        lambda x: isinstance(x.get("text"), str) and len(x["text"].strip()) > 0
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            return {"text": text if text else ""}
+        except Exception as e:
+            print(f"Error applying chat template: {e}")
+            return {"text": ""}
+
+    ds = ds.map(
+        normalize_to_messages,
+        remove_columns=[c for c in ds.column_names if c != "conversations"],
     )
-    return ds
-
-
-def load_tokenizer(cfg: TrainingConfig):
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model_cache_dir,
-        use_fast=False,
-        trust_remote_code=True,
-    )
-    tokenizer.padding_side = "right"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = cfg.sequence_length
-    return tokenizer
-
-
-def load_base_model(cfg: TrainingConfig):
-    return AutoModelForCausalLM.from_pretrained(
-        cfg.model_cache_dir,
-        dtype=cfg.precision,
-        device_map=None,
-        trust_remote_code=True,
-    )
+    return ds.filter(lambda x: x.get("text", "").strip())
 
 
 def create_trainer(
@@ -180,11 +184,13 @@ def create_trainer(
         warmup_steps=cfg.warmup_steps,
         learning_rate=cfg.lr,
         weight_decay=cfg.weight_decay,
+        lr_scheduler_type=cfg.lr_scheduler_type,
+        optim=cfg.optim,
         num_train_epochs=cfg.epochs,
         max_steps=cfg.max_training_steps,
         logging_steps=cfg.log_interval,
         save_steps=cfg.checkpoint_interval,
-        save_total_limit=3,
+        save_total_limit=cfg.save_total_limit,
         output_dir=cfg.results_dir,
         bf16=cfg.precision == torch.bfloat16,
         fp16=cfg.precision == torch.float16,
@@ -211,36 +217,62 @@ def run_training(cfg: TrainingConfig) -> None:
     base_dir = Path(cfg.results_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    exp_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    exp_dir = base_dir / exp_id
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    
-    with (exp_dir / "config.yaml").open("w") as f:
-        yaml.dump(asdict(cfg), f, default_flow_style=False, sort_keys=False)
-    
-    cache_path = base_dir / (cfg.model_cache_dir or cfg.model_id.replace("/", "__"))
+    if cfg.resume_from_checkpoint:
+        checkpoint_path = Path(cfg.resume_from_checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        output_dir = (
+            checkpoint_path.parent
+            if checkpoint_path.name.startswith("checkpoint-")
+            else checkpoint_path
+        )
+        cfg.results_dir = str(output_dir)
+        print(f"Resuming from: {checkpoint_path}")
+        run_name = output_dir.name
+    else:
+        output_dir = base_dir / cfg.config_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cfg.results_dir = str(output_dir)
+        run_name = cfg.config_name
+        config_dict = asdict(cfg)
+        config_dict["wandb_run_name"] = run_name
+        with (output_dir / "config.yaml").open("w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
     token = os.environ.get("HF_TOKEN")
-    if not cache_path.exists() or not any(cache_path.iterdir()):
-        snapshot_download(repo_id=cfg.model_id, local_dir=str(cache_path), token=token)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_id, token=token, use_fast=False, trust_remote_code=True
+    )
+    tokenizer.padding_side = "right"
+    tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+    tokenizer.model_max_length = cfg.sequence_length
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_id,
+        token=token,
+        dtype=cfg.precision,
+        device_map=None,
+        trust_remote_code=True,
+    )
+    dataset = prepare_dataset(cfg, tokenizer)
 
-    cfg.model_cache_dir = str(cache_path)
-    cfg.results_dir = str(exp_dir)
-
-    dataset = prepare_dataset(cfg)
-    tokenizer = load_tokenizer(cfg)
-    model = load_base_model(cfg)
-    trainer = create_trainer(cfg, model, tokenizer, dataset, exp_id)
-
-    trainer.train()
+    trainer = create_trainer(cfg, model, tokenizer, dataset, run_name)
+    train_output = trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint)
 
     trainer.save_model(cfg.results_dir)
     tokenizer.save_pretrained(cfg.results_dir)
 
+    if train_output.metrics:
+        with (output_dir / "training_metrics.json").open("w") as f:
+            json.dump(train_output.metrics, f, indent=2)
+
+    if cfg.config_name:
+        push_to_hub(cfg.results_dir, cfg.config_name)
+
 
 @app.function(
     image=image,
-    gpu="A100:4",
-    timeout=3 * HOURS,
+    gpu="A100:2",
+    timeout=12 * HOURS,
     volumes=VOLUME_CONFIG,
     env={
         "NCCL_DEBUG": "WARN",
@@ -251,11 +283,14 @@ def run_training(cfg: TrainingConfig) -> None:
         modal.Secret.from_name("wandb"),
     ],
 )
-def train_distributed(config_path: str | None = None):
+def train_distributed(config_path: str, resume_from_checkpoint: str = None):
     """Launch distributed training via accelerate."""
     num_gpus = max(1, torch.cuda.device_count())
-    precision_str = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "fp16"
-
+    precision = (
+        "bf16"
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else "fp16"
+    )
     cmd = [
         "accelerate",
         "launch",
@@ -264,102 +299,93 @@ def train_distributed(config_path: str | None = None):
         "--num_machines",
         "1",
         "--mixed_precision",
-        precision_str,
+        precision,
         "--dynamo_backend",
         "no",
         "/app/src/train.py",
+        "--config",
+        config_path,
     ]
-    
-    env = os.environ.copy()
-    if config_path:
-        env["TRAIN_CONFIG_PATH"] = config_path
-    
-    subprocess.run(
-        cmd,
-        check=True,
-        cwd="/app",
-        env=env,
-    )
+    if resume_from_checkpoint:
+        cmd.extend(["--resume-from-checkpoint", resume_from_checkpoint])
+    subprocess.run(cmd, check=True, cwd="/app")
 
 
-@app.function(
-    image=image,
-    secrets=[
-        modal.Secret.from_name("my-huggingface-secret"),
-        modal.Secret.from_name("wandb"),
-    ],
-    volumes=VOLUME_CONFIG,
-)
-def push_to_hub(checkpoint_path: str, repo_name: str):
+@app.local_entrypoint()
+def train(config_path: str, resume_from_checkpoint: str = None):
+    """Local entrypoint to start training."""
+    train_distributed.remote(config_path, resume_from_checkpoint)
+
+
+def push_to_hub(output_dir: str, repo_name: str):
+    """
+    Push checkpoint to HF.
+
+    Args:
+        output_dir: Path to experiment output directory ("/outputs/llama-3.2-3B-finetome")
+        repo_name: Repo name ("username/llama-3.2-3B-finetome")
+
+    """
     token = os.environ.get("HF_TOKEN")
     if not token:
-        raise ValueError("HF_TOKEN environment variable must be set")
-
+        raise ValueError("HF_TOKEN required")
     api = HfApi(token=token)
     username = api.whoami(token=token)["name"]
+    output_path = Path(output_dir)
 
-    checkpoint_dir = Path(checkpoint_path)
-    
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_dir}")
+    with (output_path / "config.yaml").open() as f:
+        model_id = yaml.safe_load(f).get("model_id", "meta-llama/Llama-3.2-3B-Instruct")
 
-    config_path = checkpoint_dir / "config.yaml"
-    if config_path.exists():
-        model_id = yaml.safe_load(config_path.open()).get("model_id", "meta-llama/Llama-3.2-3B-Instruct")
-    else:
-        adapter_path = checkpoint_dir / "adapter_config.json"
-        base_model = json.load(adapter_path.open()).get("base_model_name_or_path", "")
-        model_id = base_model.replace("/outputs/", "").replace("__", "/") if base_model.startswith("/outputs/") else base_model
-
-    adapter_path = checkpoint_dir / "adapter_config.json"
-    adapter_config = json.load(adapter_path.open())
-    if adapter_config.get("base_model_name_or_path", "").startswith("/outputs/"):
+    adapter_path = output_path / "adapter_config.json"
+    if adapter_path.exists():
+        with adapter_path.open() as f:
+            adapter_config = json.load(f)
         adapter_config["base_model_name_or_path"] = model_id
-        json.dump(adapter_config, adapter_path.open("w"), indent=2)
+        with adapter_path.open("w") as f:
+            json.dump(adapter_config, f, indent=2)
 
-    repo_name = f"{username}/{repo_name}"
-    api.create_repo(repo_id=repo_name, repo_type="model", exist_ok=True)
-    api.upload_folder(repo_id=repo_name, repo_type="model", folder_path=str(checkpoint_dir), path_in_repo=".", commit_message="Upload fine-tuned LoRA adapter weights")
-    return repo_name
+    readme_path = output_path / "README.md"
+    readme_path.unlink(missing_ok=True)
+    readme_path.write_text(
+        f"""---
+base_model: {model_id}
+library_name: peft
+pipeline_tag: text-generation
+tags:
+- base_model:adapter:{model_id}
+- lora
+- sft
+- transformers
+- trl
+---
+"""
+    )
 
-
-@app.local_entrypoint()
-def run(config_path: str | None = None):
-    """
-    Local entrypoint to start training.
-    
-    Args:
-        config_path: Optional path to YAML config file (e.g., "config/llama-train.yml")
-    """
-    train_distributed.remote(config_path)
-
-
-@app.local_entrypoint()
-def push(checkpoint_path: str, repo_name: str):
-    """
-    Local entrypoint to push model to HF.
-    Calls the remote Modal function which has access to volumes.
-    
-    Args:
-        checkpoint_path: Path to checkpoint directory (e.g., "/outputs/20251204-112716/checkpoint-1000")
-        repo_name: Repo name (e.g., "llama-finetome" creates "username/llama-finetome")
-    """
-    repo_id = push_to_hub.remote(checkpoint_path, repo_name)
-    print(f"Uploaded to https://huggingface.co/{repo_id}")
+    repo_id = f"{username}/{repo_name}"
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    api.upload_folder(
+        repo_id=repo_id,
+        repo_type="model",
+        folder_path=str(output_path),
+        path_in_repo=".",
+        commit_message="Upload fine-tuned LoRA adapter",
+        ignore_patterns=["checkpoint-*", "runs", "*.log"],
+    )
 
 
 if __name__ == "__main__":
-    import argparse
-    
     parser = argparse.ArgumentParser(description="Train a model with LoRA fine-tuning")
     parser.add_argument(
-        "--config",
+        "--config", type=str, required=True, help="Path to YAML configuration file"
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
         type=str,
-        help="Path to YAML configuration file",
+        default=None,
+        help="Path to checkpoint directory to resume training from",
     )
     args = parser.parse_args()
-    
-    config_path = args.config or os.environ.get("TRAIN_CONFIG_PATH")
-    
-    config = load_config(config_path) if config_path else TrainingConfig()
-    run_training(config)
+    cfg = load_config(args.config)
+    if args.resume_from_checkpoint:
+        cfg.resume_from_checkpoint = args.resume_from_checkpoint
+    run_training(cfg)

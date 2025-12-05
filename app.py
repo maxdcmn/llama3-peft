@@ -1,60 +1,150 @@
+import json
+
 import gradio as gr
 import openai
+from ddgs import DDGS
 
-client_finetuned = openai.OpenAI(
-    api_key="NONE",
-    base_url="https://filip-max-marc-modal-hackathon--llama3-finetome-serve.modal.run/v1",
-)
+MODELS = {
+    "Finetome": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve.modal.run/v1",
+    "DDGS": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-ddg-serve.modal.run/v1",
+}
+TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_duckduckgo",
+        "description": "Search the web",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
 
 
-def agent_respond(history, temperature=0.7, max_tokens=512):
+def search(query: str) -> tuple[str, list]:
     """
-    Takes a chat history and returns the assistant's reply content.
+    Searches the web for the given query and returns the results.
+
+    Args:
+        query (str): The query to search for
+
+    Returns:
+        tuple[str, list]: A tuple containing the search results and the sources
     """
-    system_message = {"role": "system", "content": "You are a friendly agent."}
-    messages = [system_message] + history
-
-    print(messages)
-    response = client_finetuned.chat.completions.create(
-        model="llm",
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-
-    return response.choices[0].message.content
+    try:
+        results = list(DDGS().text(query, max_results=3))
+        full = "\n".join(f"{r['title']}: {r['body']}" for r in results) or "No results"
+        sources = [{"title": r["title"], "url": r["href"]} for r in results]
+        return full, sources
+    except:
+        return "Search failed", []
 
 
-def interact_with_agent(user_message, history, temperature, max_tokens):
+def chat(
+    messages: list,
+    model_url: str,
+    use_tools: bool,
+    temp: float,
+    max_tokens: int,
+    sources: list = None,
+) -> str:
     """
-    Interface function for Gradio.
-    Takes the latest user message and chat history, returns assistant response.
+    Chats with the model and returns the response.
+
+    Args:
+        messages (list): The messages to chat with
+        model_url (str): The URL of the model
+        use_tools (bool): Whether to use tools
+        temp (float): The temperature
+        max_tokens (int): The maximum tokens
+        sources (list): The sources
+
+    Returns:
+        str: The response
     """
-    if history is None:
-        history = []
+    if sources is None:
+        sources = []
 
-    history = history + [{"role": "user", "content": user_message}]
+    client = openai.OpenAI(api_key="NONE", base_url=model_url)
+    kwargs = {
+        "model": "llm",
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": max_tokens,
+    }
+    if use_tools:
+        kwargs["tools"] = [TOOL]
+    resp = client.chat.completions.create(**kwargs).choices[0].message
 
-    response = agent_respond(history, temperature, max_tokens)
+    if resp.tool_calls:
+        args = json.loads(resp.tool_calls[0].function.arguments)
+        query = args.get("query", "")
+        result, new_sources = search(query)
+        sources.extend(new_sources)
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Search results: {result}\n\nAnswer based on this.",
+            }
+        )
+        return chat(messages, model_url, False, temp, max_tokens, sources)
 
+    response = resp.content or ""
+    if sources:
+        source_links = " ".join(f"[[{i+1}]]({s['url']})" for i, s in enumerate(sources))
+        return f"{response}\n\nSources: {source_links}"
     return response
 
 
-with gr.Blocks(title="Custom LLM") as demo:
+def respond(message: str, history: list, model: str, temp: float, max_tok: int) -> str:
+    """
+    Responds to a message with a model and returns the response.
+
+    Args:
+        message (str): The message to respond to
+        history (list): The chat history
+        model (str): The model to use
+        temp (float): The temperature
+        max_tok (int): The maximum tokens
+
+    Returns:
+        str: The response
+    """
+    if model == "DDGS":
+        system = "You are a helpful assistant with access to a web search tool. Use the search tool ONLY when you need current information (news, prices, weather, recent events). For general knowledge questions, answer directly without searching. Do not mention the search tool in your response."
+    else:
+        system = "You are a helpful assistant."
+
+    messages = [{"role": "system", "content": system}]
+    for h in (history or [])[-6:]:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": message})
+
+    try:
+        return chat(messages, MODELS[model], model == "DDGS", temp, max_tok)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+with gr.Blocks(title="LLM Chat") as demo:
     gr.Markdown("<p style='padding: 20px 0;'></p>")
-
-    with gr.Row():
-        temperature = gr.Slider(0.1, 1.0, value=0.7, step=0.01, label="Temperature")
-        max_tokens = gr.Slider(16, 1024, value=512, step=16, label="Max Tokens")
-
-    chatbot = gr.Chatbot(label="Custom LLM", height=600)
-
-    gr.ChatInterface(
-        interact_with_agent,
-        chatbot=chatbot,
-        additional_inputs=[temperature, max_tokens],
-        textbox=gr.Textbox(placeholder="Ask me anything..."),
-        fill_height=True,
-    )
+    with gr.Tabs():
+        with gr.Tab("Finetome"):
+            with gr.Row():
+                temp1 = gr.Slider(0.0, 1.0, 0.7, label="Temperature")
+                max_tok1 = gr.Slider(64, 512, 256, label="Max Tokens")
+            gr.ChatInterface(
+                lambda m, h, t, mt: respond(m, h, "Finetome", t, mt),
+                additional_inputs=[temp1, max_tok1],
+            )
+        with gr.Tab("DDGS"):
+            with gr.Row():
+                temp2 = gr.Slider(0.0, 1.0, 0.7, label="Temperature")
+                max_tok2 = gr.Slider(64, 512, 256, label="Max Tokens")
+            gr.ChatInterface(
+                lambda m, h, t, mt: respond(m, h, "DDGS", t, mt),
+                additional_inputs=[temp2, max_tok2],
+            )
 
 demo.launch()

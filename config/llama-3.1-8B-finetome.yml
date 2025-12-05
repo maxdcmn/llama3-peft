@@ -1,0 +1,54 @@
+# Model Configuration
+model_id: meta-llama/Llama-3.1-8B-Instruct
+config_name: llama-3.1-8B-finetome
+
+dataset_id: mlabonne/FineTome-100k # "local:path.jsonl" for local datasets
+dataset_split: train
+
+# LoRA Adapter Configuration
+lora_rank: 16
+lora_alpha: 32
+lora_dropout_rate: 0.05
+lora_targets:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# Sequence and batch configuration
+sequence_length: 1024
+batch_size_per_device: 1
+gradient_accumulation: 8
+
+# Learning rate and optimization
+lr: 2e-4
+weight_decay: 0.01
+warmup_steps: 50
+
+# Training duration
+epochs: 1
+max_training_steps: 2000
+
+# Logging and checkpointing
+log_interval: 10
+checkpoint_interval: 200
+
+# Output directory
+results_dir: /outputs
+
+# Random seed for reproducibility
+random_seed: 2342342
+
+# Gradient checkpointing (memory optimization)
+enable_gradient_checkpointing: true
+gradient_checkpointing_opts:
+  use_reentrant: false
+
+# Distributed training
+ddp_unused_params: false
+
+# bfloat16, float16, or null for auto-detection
+precision: null

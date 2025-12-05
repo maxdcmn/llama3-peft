@@ -3,6 +3,12 @@ import subprocess
 import modal
 
 MINUTES = 60
+BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+LORA_ADAPTER = "maxdcmn/llama-3.2-finetome-ddg-tool"
+APP = "llama-3.2-3B-finetome-ddg"
+GPU = "L40S:1"
+VLLM_PORT = 8000
+
 
 vllm_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
@@ -12,20 +18,11 @@ vllm_image = (
         "huggingface-hub==0.36.0",
         "flashinfer-python==0.5.2",
     )
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"}) # faster model transfers
+    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
-
-
-BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-LORA_ADAPTER = "maxdcmn/llama-finetome"
-APP = "llama3-finetome"
-GPU = "L40S:1" # Format: "GPU_TYPE:COUNT" e.g., "L40S:1", "A100:2"
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-
-VLLM_PORT = 8000
-
 
 app = modal.App(APP)
 

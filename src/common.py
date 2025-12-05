@@ -10,6 +10,7 @@ if APP_DIR.exists():
 app = modal.App(name="llama3-peft-training")
 
 vol = modal.Volume.from_name("model-checkpoints", create_if_missing=True)
+hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -39,7 +40,10 @@ vllm_image = (
 MINUTES = 60
 HOURS = 60 * MINUTES
 
-VOLUME_CONFIG = {"/outputs": vol}
+VOLUME_CONFIG = {
+    "/outputs": vol,
+    "/root/.cache/huggingface": hf_cache_vol,
+}
 
 
 class Colors:
