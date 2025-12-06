@@ -1,13 +1,15 @@
-# Llama 3 PEFT
+# Llama 3 Parameter Efficient Finetuning
 
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
-![Modal](https://img.shields.io/badge/Modal-000000?logo=modal&logoColor=white)
-![HuggingFace](https://img.shields.io/badge/HuggingFace-FFD21E?logo=huggingface&logoColor=black)
-![W&B](https://img.shields.io/badge/Weights_&_Biases-FFBE00?logo=weightsandbiases&logoColor=black)
+![HuggingFace](https://img.shields.io/badge/HuggingFace-FFD21E?logo=huggingface&logoColor=white)
+![W&B](https://img.shields.io/badge/Weights_&_Biases-FFBE00?logo=weightsandbiases&logoColor=white)
+![Modal](https://img.shields.io/badge/Modal-000000?logo=modal)
 
 This repo contains a parameter efficient finetuning pipeline for Llama 3 on Modal. The goal is to understand fine-tuning on limited GPU resources.
 
-Built on top of the [Modal Labs LLM Finetuning guide](https://github.com/modal-labs/llm-finetuning).
+Built using the [Modal Labs LLM Finetuning guide](https://github.com/modal-labs/llm-finetuning), [Modal Unsloth finetuning example](https://modal.com/docs/examples/unsloth_finetune), and [HuggingFace SFT guide](https://huggingface.co/blog/mlabonne/sft-llama3).
+
+![Chat](assets/chat.png)
 
 ## Setup
 
@@ -44,7 +46,7 @@ modal run src.train --config config/llama-3.2-3B-finetome.yml --resume-from-chec
 Update the configuration in `src/serve.py` with your adapter, then deploy:
 ```python
 BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-LORA_ADAPTER = "maxdcmn/llama-3.2-finetome-ddg-tool"  # Your trained adapter
+LORA_ADAPTER = "maxdcmn/llama-3.2-finetome-ddg-tool" # Your trained adapter
 GPU = "L40S:1"
 ```
 
@@ -52,7 +54,7 @@ GPU = "L40S:1"
 modal deploy src/serve.py
 ```
 
-Start the Gradio interface locally: `python app.py`
+Update the model URLs in `app.py` to point to your deployed Modal endpoints, then start the Gradio interface: `python app.py`
 
 
 ## Trained Models
@@ -96,7 +98,7 @@ llama3-peft/
 
 #### Training Framework Comparison
 
-`src/train.py` runs on Modal with 2x A100s. Tested Llama 3.2 1B, 3B, and Llama 3.1 8B. The 3B model reached ~0.7 loss after about 2 hours. A full train 
+`src/train.py` runs on Modal with 2x A100s. Tested Llama 3.2 1B, 3B, and Llama 3.1 8B. Short runs (2000 steps) showed 1B at ~0.8 loss, 3B at ~0.7, and 8B at ~0.6; clear scaling benefit. A full 5-epoch run (25000 steps) on the 3B model reached ~0.5 loss, showing further improvements with longer training.
 
 `notebooks/01_finetune-baseline.ipynb` uses Unsloth on a B200. Trained `unsloth/Llama-3.2-3B-Instruct` with rank 64 + RSLoRA, batch size 128, and packing. Reached ~0.64 loss in 44 minutes.
 
@@ -115,23 +117,17 @@ The Modal setup is designed for testing different model sizes, hyperparameters, 
 
 #### Training Hyperparameters
 
-| Parameter | Tested | Observation |
+| Parameter | Tested | Notes |
 |-----------|--------|-------------|
-| `learning_rate` | 2e-4, 3e-4 | Both converged to similar final loss in short runs. 2e-4 is a stable default. |
-| `lr_scheduler` | linear, cosine | No significant difference in final loss between schedulers. |
-| `warmup_steps` | 50 | 50 steps (~2.5% of 2000) works well for stability. |
-| `batch_size` | 1, 2 | Per-device batch size. Batch 2 requires gradient checkpointing on 40GB GPUs. |
-| `gradient_accumulation` | 4, 6, 8 | Accumulates gradients over N steps before updating. |
-| `sequence_len` | 2048, 4096 | No noticeable improvement with 4096. 2048 is sufficient for FineTome. |
-| `gradient_checkpointing` | true/false | Recomputes activations during backward pass. Slower but reduces memory usage. |
+| `learning_rate` | 2e-4, 3e-4 | Tested in short runs and ended up at similar loss (~0.7). |
+| `lr_scheduler` | linear, cosine | Tested cosine vs linear, loss curves looked almost identical. Doesn't seem to influence much. |
+| `warmup_steps` | 50 | Used 50 steps (~2.5% of 2000) to ramp up the learning rate gradually. No divergence issues. |
+| `batch_size` | 1, 2 | Batch size 2 needs gradient checkpointing on 40GB GPUs. Batch 1 works but is slower. |
+| `gradient_accumulation` | 4, 6, 8 | All configurations resulted in similar results. Allows for larger effective batches because it accumulates gradients over N steps before updating. |
+| `sequence_len` | 2048, 4096 | Doubled to 4096 to see if longer context helps. Loss didn't improve, so 2048 is enough for this dataset. |
+| `gradient_checkpointing` | true/false | Enables larger batch sizes by trading compute for memory. Makes training slower because it recomputes activations during backward pass. |
 
-#### Model Size
-
-| Model | Final Loss | Observation |
-|-------|------------|-------------|
-| Llama 3.2 1B | ~0.8 | Noisier convergence, limited capacity. |
-| Llama 3.2 3B | ~0.7 | Good quality/cost tradeoff. |
-| Llama 3.1 8B | ~0.6 | Best quality, but more compute. |
+We used full bf16 precision for all experiments. Additional optimizations we didn't test include quantization (4-bit/8-bit QLoRA) and 8-bit optimizers (`adamw_8bit`) for example.
 
 ---
 
@@ -142,9 +138,11 @@ The Modal setup is designed for testing different model sizes, hyperparameters, 
 | Dataset | Size | Purpose |
 |---------|------|---------|
 | [FineTome-100k](https://huggingface.co/datasets/mlabonne/FineTome-100k) | 100k | General instruction-following |
-| DDG Search (custom) | 2,200 | DuckDuckGo tool-calling examples |
+| DDG Search (custom) | 2,200 | Generated DuckDuckGo tool-calling examples with summarization |
 
-We tested three data configurations. Training on FineTome only gave stable convergence at around ~0.5 after 5 epochs (25000 steps). Training on the custom DDG dataset caused the loss to drop to ~0.02, a sign of overfitting. Combining both datasets kept loss at ~0.7 while still teaching tool-calling behavior.
+We tested three data configurations. Training on FineTome gave stable convergence at around ~0.5 after 5 epochs (25000 steps). Training on the custom DDG dataset caused the loss to drop to ~0.02, a sign of overfitting. Combining both datasets kept loss at ~0.7 while still teaching tool-calling behavior.
+
+For better evaluation, we could split datasets into train/eval/test sets to assess generalization. FineTome could also be trimmed to a subset to allow for multiple epoch runs.
 
 <p align="center">
   <img src="logs/plots/llama_3.2_3b_different_hyperparameters.png" width="49%" />
@@ -154,3 +152,6 @@ We tested three data configurations. Training on FineTome only gave stable conve
   <img src="logs/plots/different_model_sizes.png" width="49%" />
   <img src="logs/plots/llama_3.2_3b_different_datasets.png" width="49%" />
 </p>
+
+![W&B](assets/wandb.png)
+![Modal](assets/modal.png)

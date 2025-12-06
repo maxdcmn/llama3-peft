@@ -46,7 +46,7 @@ def main():
     ds = Dataset.from_list(all_rows)
     ds.push_to_hub(repo_id, token=token)
     print(
-        f"✓ Pushed {len(base)} FineTome + {len(ddg)} DDG tool-calling examples to {repo_id}"
+        f"Pushed {len(base)} FineTome + {len(ddg)} DDG tool-calling examples to {repo_id}"
     )
 
 

@@ -4,7 +4,7 @@ import modal
 
 MINUTES = 60
 BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-LORA_ADAPTER = "maxdcmn/llama-3.2-finetome"
+LORA_ADAPTER = "maxdcmn/llama-3.2-3B-finetome"
 APP = "llama-3.2-3B-finetome"
 GPU = "L40S:1"
 VLLM_PORT = 8000

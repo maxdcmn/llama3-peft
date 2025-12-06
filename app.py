@@ -5,7 +5,7 @@ import openai
 from ddgs import DDGS
 
 MODELS = {
-    "FineTome": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve-dev.modal.run/v1",
+    "FineTome": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve.modal.run/v1",
     "DDGS": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-ddg-serve.modal.run/v1",
 }
 TOOL = {
@@ -117,7 +117,7 @@ def respond(message: str, history: list, model: str, temp: float, max_tok: int) 
         system = "You are a helpful assistant."
 
     messages = [{"role": "system", "content": system}]
-    for h in (history or [])[-6:]:
+    for h in (history or [])[-6:]: # keep the last 6 messages as context
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": message})
 
@@ -127,16 +127,26 @@ def respond(message: str, history: list, model: str, temp: float, max_tok: int) 
         return f"Error: {e}"
 
 
-with gr.Blocks(title="LLM Chat") as demo:
-    gr.Markdown("<p style='padding: 20px 0;'></p>")
+# gradio chat interface with model selection, temperature and the max tokens limit
+with gr.Blocks(title="Llama 3.2 3B Chat") as demo:
+    gr.Markdown("# Finetuned Llama-3.2-3B-Instruct Chat")
     with gr.Tabs():
         with gr.Tab("FineTome"):
             with gr.Row():
                 temp1 = gr.Slider(0.0, 1.0, 0.7, label="Temperature")
-                max_tok1 = gr.Slider(64, 512, 256, label="Max Tokens")
+                max_tok1 = gr.Slider(64, 1024, 256, label="Max Tokens")
+            # m=message, h=history, t=temp, mt=max_tokens
             gr.ChatInterface(
                 lambda m, h, t, mt: respond(m, h, "FineTome", t, mt),
                 additional_inputs=[temp1, max_tok1],
+                submit_btn="Send",
+                chatbot=gr.Chatbot(height=500),
+                examples=[
+                    ["Explain quantum computing in simple terms"],
+                    ["Write a haiku about programming"],
+                    ["What are the pros and cons of remote work?"],
+                    ["How do I make a good cup of coffee?"],
+                ],
             )
         with gr.Tab("DDGS"):
             with gr.Row():
@@ -145,6 +155,15 @@ with gr.Blocks(title="LLM Chat") as demo:
             gr.ChatInterface(
                 lambda m, h, t, mt: respond(m, h, "DDGS", t, mt),
                 additional_inputs=[temp2, max_tok2],
+                submit_btn="Send",
+                chatbot=gr.Chatbot(height=500),
+                examples=[
+                    ["What is the current price of Bitcoin?"],
+                    ["How will the weather in Barcelona be tomorrow?"],
+                    ["Who won the latest Champions League final?"],
+                    ["What are today's top news headlines?"],
+                ],
             )
+    gr.Markdown("<small>*First request may take ~30s while Modal spins up the GPU.*</small>")
 
 demo.launch()
