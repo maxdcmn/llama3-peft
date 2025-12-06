@@ -6,7 +6,7 @@ dataset_id: mlabonne/FineTome-100k # "local:path.jsonl" for local datasets
 dataset_split: train
 
 # LoRA Adapter Configuration
-# Trial 4: Larger batch size (2) with scaled LR for 2x effective batch
+# Trial 4: Larger batch size (2) with scaled LR (3.5e-4) and gradient checkpointing
 lora_rank: 16
 lora_alpha: 32
 lora_dropout_rate: 0.05
@@ -22,7 +22,7 @@ lora_targets:
 # Sequence and batch configuration
 sequence_length: 2048
 batch_size_per_device: 2
-gradient_accumulation: 8
+gradient_accumulation: 4
 
 # Learning rate and optimization
 lr: 3.5e-4
@@ -44,7 +44,7 @@ results_dir: /outputs
 random_seed: 9024309
 
 # Gradient checkpointing (memory optimization)
-enable_gradient_checkpointing: false
+enable_gradient_checkpointing: true
 gradient_checkpointing_opts:
   use_reentrant: false
 

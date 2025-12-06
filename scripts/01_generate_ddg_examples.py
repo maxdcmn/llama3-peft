@@ -16,7 +16,7 @@ QUESTIONS_PER_DOMAIN = 50
 MAX_RESULTS = 4
 RATE_LIMIT = 0.1
 OUT_FILE = "data/ddg-search.jsonl"
-BASE_URL = "https://filip-max-marc-modal-hackathon--llama3-finetome-serve.modal.run/v1"
+BASE_URL = "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve.modal.run/v1"
 
 DOMAINS = [
     "news and current events",

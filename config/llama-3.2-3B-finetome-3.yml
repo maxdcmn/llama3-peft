@@ -6,7 +6,7 @@ dataset_id: mlabonne/FineTome-100k # "local:path.jsonl" for local datasets
 dataset_split: train
 
 # LoRA Adapter Configuration
-# Trial 3: Aggressive LR (3e-4) with cosine scheduler - only changes from baseline
+# Trial 3: Aggressive LR (3e-4) with cosine scheduler
 lora_rank: 16
 lora_alpha: 32
 lora_dropout_rate: 0.05

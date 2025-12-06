@@ -6,7 +6,7 @@ dataset_id: mlabonne/FineTome-100k # "local:path.jsonl" for local datasets
 dataset_split: train
 
 # LoRA Adapter Configuration
-# Trial 1: Higher dropout (0.15) for better regularization on small datasets
+# Trial 1: Higher dropout (0.15)
 lora_rank: 16
 lora_alpha: 32
 lora_dropout_rate: 0.15
