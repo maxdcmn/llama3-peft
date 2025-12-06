@@ -5,7 +5,7 @@ import openai
 from ddgs import DDGS
 
 MODELS = {
-    "Finetome": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve.modal.run/v1",
+    "FineTome": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-finetome-serve-dev.modal.run/v1",
     "DDGS": "https://filip-max-marc-modal-hackathon--llama-3-2-3b-ddg-serve.modal.run/v1",
 }
 TOOL = {
@@ -130,12 +130,12 @@ def respond(message: str, history: list, model: str, temp: float, max_tok: int) 
 with gr.Blocks(title="LLM Chat") as demo:
     gr.Markdown("<p style='padding: 20px 0;'></p>")
     with gr.Tabs():
-        with gr.Tab("Finetome"):
+        with gr.Tab("FineTome"):
             with gr.Row():
                 temp1 = gr.Slider(0.0, 1.0, 0.7, label="Temperature")
                 max_tok1 = gr.Slider(64, 512, 256, label="Max Tokens")
             gr.ChatInterface(
-                lambda m, h, t, mt: respond(m, h, "Finetome", t, mt),
+                lambda m, h, t, mt: respond(m, h, "FineTome", t, mt),
                 additional_inputs=[temp1, max_tok1],
             )
         with gr.Tab("DDGS"):

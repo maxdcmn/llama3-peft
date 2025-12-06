@@ -81,7 +81,15 @@ class TrainingConfig:
 
 
 def load_config(config_path: str) -> TrainingConfig:
-    """Load training configuration from a YAML file."""
+    """
+    Load training configuration from a YAML file.
+
+    Args:
+        config_path: Path to the YAML configuration file
+
+    Returns:
+        TrainingConfig: Training configuration
+    """
     path = Path(config_path)
     if not path.is_absolute() and (modal_path := APP_DIR / path).exists():
         path = modal_path
@@ -109,6 +117,17 @@ def load_config(config_path: str) -> TrainingConfig:
 
 
 def prepare_dataset(cfg: TrainingConfig, tokenizer) -> Dataset:
+    """
+    Prepare the dataset for training.
+
+    Args:
+        cfg: Training configuration
+        tokenizer: Tokenizer
+
+    Returns:
+        Dataset: Prepared dataset
+    """
+    # Load dataset from local JSONL file or HuggingFace Hub
     if cfg.dataset_id.startswith("local:"):
         path = Path(cfg.dataset_id.replace("local:", ""))
         if not path.is_absolute():
@@ -117,20 +136,27 @@ def prepare_dataset(cfg: TrainingConfig, tokenizer) -> Dataset:
     else:
         ds = load_dataset(cfg.dataset_id, split=cfg.dataset_split)
 
+    # FineTome uses "human"/"gpt", but Llama expects "user"/"assistant"
     ROLE_MAP = {"human": "user", "gpt": "assistant"}
 
-    def normalize_to_messages(example):
+    def convert_chat_format(example):
+        """
+        Convert different chat formats to Llamas expected format, then apply
+        the tokenizers chat template to get the final training text.
+        """
         conv = example.get("conversations", [])
         if not conv:
             return {"text": ""}
 
         messages = []
         for turn in conv:
+            # FineTome format: {"from": "human", "value": "..."}
             if "from" in turn:
                 msg = {
                     "role": ROLE_MAP.get(turn.get("from", "user"), "user"),
                     "content": turn.get("value", ""),
                 }
+            # Tool response format (for DDG dataset)
             elif turn.get("role") == "tool":
                 msg = {
                     "role": "tool",
@@ -138,16 +164,19 @@ def prepare_dataset(cfg: TrainingConfig, tokenizer) -> Dataset:
                     "tool_call_id": turn.get("tool_call_id"),
                     "name": turn.get("name"),
                 }
+            # Standard format: {"role": "user", "content": "..."}
             else:
                 msg = {
                     "role": turn.get("role", "assistant"),
                     "content": turn.get("content", ""),
                 }
+                # Preserve tool_calls if present (for training tool-calling behavior)
                 tool_calls = turn.get("tool_calls")
                 if tool_calls and len(tool_calls) > 0:
                     msg["tool_calls"] = tool_calls
             messages.append(msg)
 
+        # Apply the models chat template to get properly formatted training text (adds special tokens)
         try:
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False
@@ -158,15 +187,29 @@ def prepare_dataset(cfg: TrainingConfig, tokenizer) -> Dataset:
             return {"text": ""}
 
     ds = ds.map(
-        normalize_to_messages,
+        convert_chat_format,
         remove_columns=[c for c in ds.column_names if c != "conversations"],
     )
+    # Filter out empty examples
     return ds.filter(lambda x: x.get("text", "").strip())
 
 
 def create_trainer(
     cfg: TrainingConfig, model, tokenizer, dataset: Dataset, run_name: str
 ) -> SFTTrainer:
+    """
+    Create the trainer.
+
+    Args:
+        cfg (TrainingConfig): Training configuration
+        model: Model
+        tokenizer: Tokenizer
+        dataset (Dataset): Dataset
+        run_name (str): Name of the run
+
+    Returns:
+        SFTTrainer: Trainer
+    """
     peft_config = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
@@ -213,7 +256,13 @@ def create_trainer(
     )
 
 
-def run_training(cfg: TrainingConfig) -> None:
+def run_training(cfg: TrainingConfig):
+    """
+    Run the training.
+
+    Args:
+        cfg: Training configuration
+    """
     base_dir = Path(cfg.results_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,7 +333,13 @@ def run_training(cfg: TrainingConfig) -> None:
     ],
 )
 def train_distributed(config_path: str, resume_from_checkpoint: str = None):
-    """Launch distributed training via accelerate."""
+    """
+    Launch distributed training via accelerate.
+
+    Args:
+        config_path: Path to the YAML configuration file
+        resume_from_checkpoint: Path to the checkpoint directory to resume training from
+    """
     num_gpus = max(1, torch.cuda.device_count())
     precision = (
         "bf16"
@@ -313,7 +368,13 @@ def train_distributed(config_path: str, resume_from_checkpoint: str = None):
 
 @app.local_entrypoint()
 def train(config_path: str, resume_from_checkpoint: str = None):
-    """Local entrypoint to start training."""
+    """
+    Local entrypoint to start training.
+
+    Args:
+        config_path (str): Path to the YAML configuration file
+        resume_from_checkpoint (str): Path to the checkpoint directory to resume training from
+    """
     train_distributed.remote(config_path, resume_from_checkpoint)
 
 
@@ -322,9 +383,8 @@ def push_to_hub(output_dir: str, repo_name: str):
     Push checkpoint to HF.
 
     Args:
-        output_dir: Path to experiment output directory ("/outputs/llama-3.2-3B-finetome")
-        repo_name: Repo name ("username/llama-3.2-3B-finetome")
-
+        output_dir (str): Path to experiment output directory ("/outputs/llama-3.2-3B-finetome")
+        repo_name (str): Repo name ("username/llama-3.2-3B-finetome")
     """
     token = os.environ.get("HF_TOKEN")
     if not token:
@@ -368,7 +428,7 @@ tags:
         repo_type="model",
         folder_path=str(output_path),
         path_in_repo=".",
-        commit_message="Upload fine-tuned LoRA adapter",
+        commit_message="Upload finetuned LoRA adapter",
         ignore_patterns=["checkpoint-*", "runs", "*.log"],
     )
 
